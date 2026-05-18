@@ -1,0 +1,293 @@
+pip install -q pandas; openpyxl; requests; transformers; torch; spacy;
+python -m; spacy
+download en_core_web_sm
+
+import os, time, zipfile, requests, pandas as pd
+from typing import List, Dict, Any
+from dataclasses import dataclass
+
+# NLP/Retrieval
+import spacy
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
+
+# OpenAI SDK
+from openai import OpenAI
+
+# Colab Uploads
+from google.colab import files
+
+# ---------------------------
+# CONFIG
+TARGET_MATCHES_PER_TERM = 3     # Collect up to 3 exact JRC matches per term
+MAX_KG_TERMS_TO_CONSIDER = 200
+SHOW_PREVIEW = 10
+OPENAI_MODEL = "gpt-5-mini"
+
+# ---------------------------
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ---------------------------
+# Coreon KG Setup
+nlp = spacy.load("en_core_web_sm")
+BASE_URL = "https://r04-09.coreon.com/api/v1"
+API_KEY = "xxx" #Fill in API key
+HEADERS = {"Content-Type": "application/json", "X-Core-ApiKey": API_KEY}
+
+def search_concept(concept: str):
+    payload = {"search": {"query": concept, "source_language": "en",
+               "select": {"admin": False,"history": False,"languages": ["de","en"],
+                          "concept_properties": False,"term_properties": ["Term Type"],"relations": True}}}
+    try:
+        r = requests.post(f"{BASE_URL}/concepts/search", json=payload, headers=HEADERS, timeout=30)
+        return r.json().get("hits", []) if r.status_code == 200 else []
+    except Exception as e:
+        print("🚨 API error:", e); return []
+
+def search_concept_fallback_iterative(concept: str, min_prefix_len=2, max_prefix_len=5):
+    max_prefix_len = min(max_prefix_len, len(concept))
+    for L in range(max_prefix_len, min_prefix_len - 1, -1):
+        q = concept[:L] + "*"
+        payload = {"search":{"query": q, "source_language": "en",
+                    "select":{"admin": False,"history": False,"languages": ["de","en"],
+                              "concept_properties": False,"term_properties": ["Term Type"],"relations": True}}}
+        try:
+            r = requests.post(f"{BASE_URL}/concepts/search", json=payload, headers=HEADERS, timeout=30)
+            hits = r.json().get("hits", []) if r.status_code == 200 else []
+            if len(hits) > 1:
+                return hits
+        except Exception as e: print("🚨 API error (fallback):", e); return []
+    return []
+
+def fetch_candidate_terms_from_kg(query: str) -> List[str]:
+    """Return deduped list of English KG terms for a query."""
+    hits = search_concept(query)
+    if len(hits) <= 1:
+        fh = search_concept_fallback_iterative(query)
+        if fh: hits = fh
+    terms_en = []
+    for h in hits:
+        res = h.get("result", {})
+        for t in res.get("terms", []):
+            if t.get("lang") == "en":
+                v = t.get("value", "")
+                if v:
+                    terms_en.append(v)
+    # Dedupe + drop identical to source term
+    out, seen = [], set()
+    src_lower = query.lower()
+    for t in terms_en:
+        if t.lower() == src_lower:
+            continue
+        if t not in seen:
+            out.append(t); seen.add(t)
+    return out
+
+# ---------------------------
+# Facebook Contriever Setup
+retriever_model_name = "facebook/contriever"
+tokenizer = AutoTokenizer.from_pretrained(retriever_model_name)
+retriever = AutoModel.from_pretrained(retriever_model_name).eval().to(device)
+
+@torch.no_grad()
+def embed_texts(texts: List[str], batch_size: int = 64):
+    embs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        inputs = tokenizer(batch, padding=True, truncation=True, return_tensors="pt").to(device)
+        out = retriever(**inputs).last_hidden_state[:, 0]
+        embs.append(out.detach().cpu())
+    return torch.cat(embs, dim=0)
+
+def rank_all_kg_terms_for_source(source_term: str, kg_terms: List[str]) -> List[Dict[str, Any]]:
+    """Return ALL KG terms sorted by cosine similarity."""
+    if not kg_terms:
+        return []
+    texts = [source_term] + kg_terms
+    embs = F.normalize(embed_texts(texts), p=2, dim=1)  # (1+K, D)
+    sims = (embs[0:1] @ embs[1:].T).squeeze(0).tolist()
+    paired = [{"kg_term": kg_terms[i], "cosine": float(sims[i])} for i in range(len(kg_terms))]
+    paired.sort(key=lambda x: x["cosine"], reverse=True)
+    return paired
+
+# ---------------------------
+# 1) Upload Excel file
+print("📤 Choose your Excel file…")
+_ = files.upload()
+df = pd.read_excel("Dataset_Thesis.xlsx")
+
+# Choose rows
+START_ROW = 100
+END_ROW   = 200
+row_slice = slice(START_ROW - 1, END_ROW)
+
+term_series = df.iloc[row_slice, 0].dropna()
+sent_series = df.iloc[row_slice, 2].fillna("")
+
+excel_terms = [str(x).strip() for x in term_series.tolist()]
+source_sentences = [str(x).strip() for x in sent_series.tolist()]
+
+#print(f"✅ Loaded rows {START_ROW}–{END_ROW} (total {len(excel_terms)}).")
+
+# ---------------------------
+# 2) Rank KG candidates for each term
+excel_to_ranked_kg = {}   # term -> list[{kg_term, cosine}]
+for term in excel_terms:
+    kg_terms = fetch_candidate_terms_from_kg(term)
+    ranked_all = rank_all_kg_terms_for_source(term, kg_terms)
+    if MAX_KG_TERMS_TO_CONSIDER:
+        ranked_all = ranked_all[:MAX_KG_TERMS_TO_CONSIDER]
+    excel_to_ranked_kg[term] = ranked_all
+
+# ---------------------------
+# 3) Upload & Unzip JRC-Acquis EN–DE
+print("\n📤 Upload JRC-Acquis…")
+_ = files.upload()
+with zipfile.ZipFile("de-en.txt.zip","r") as z: z.extractall("data_folder")
+
+en_path = "data_folder/JRC-Acquis.de-en.en"
+de_path = "data_folder/JRC-Acquis.de-en.de"
+assert os.path.exists(en_path) and os.path.exists(de_path), "JRC files not found."
+
+with open(en_path, encoding="utf-8") as f: english_sentences = f.read().splitlines()
+with open(de_path, encoding="utf-8") as f: german_sentences = f.read().splitlines()
+assert len(english_sentences) == len(german_sentences), "EN/DE lengths differ."
+print(f"✅ Loaded {len(english_sentences)} aligned sentence pairs.")
+
+# Precompute lowercase EN sentences for fast substring checks
+english_sentences_lower = [s.lower() for s in english_sentences]
+
+def find_first_exact_index(term: str) -> int:
+    """Return first index of exact (case-insensitive) substring match in EN sentences, or -1 if none."""
+    tl = term.lower()
+    for i, en_l in enumerate(english_sentences_lower):
+        if tl in en_l:
+            return i
+    return -1
+
+# ---------------------------
+# 4) Walk ranked KG terms to collect up to 3 exact matches for each Excel term
+per_excel_examples = {}
+for ex_term, ranked_list in excel_to_ranked_kg.items():
+    examples = []
+    used_indices = set()
+    for item in ranked_list:
+        kg_t, cos = item["kg_term"], item["cosine"]
+        idx = find_first_exact_index(kg_t)
+        if idx >= 0 and idx not in used_indices:
+            used_indices.add(idx)
+            examples.append({
+                "kg_term": kg_t,
+                "cosine": cos,
+                "index": idx,
+                "en": english_sentences[idx],
+                "de": german_sentences[idx],
+            })
+        if len(examples) >= TARGET_MATCHES_PER_TERM:
+            break
+    per_excel_examples[ex_term] = examples
+
+# ---------------------------
+# 5) Translate with GPT5 using the term's examples
+from google.colab import userdata
+
+def openai_client() -> OpenAI:
+    return OpenAI(api_key=userdata.get("OPENAI_API_KEY"))
+
+def build_glossary_block(example: Dict[str, Any], idx: int) -> str:
+    return (
+        f"{idx}) EN: {example['en']}\n"
+        f"   DE: {example['de']}\n"
+        f"   (Matched KG term: {example['kg_term']} | cosine={example['cosine']:.3f})"
+    )
+
+def build_user_content(examples: List[Dict[str, Any]], source_sentence: str) -> str:
+    header = "Context examples (EN→DE):\n"
+    blocks = "\n".join(build_glossary_block(ex, i+1) for i, ex in enumerate(examples)) if examples else "(no examples available)\n"
+    task = (
+        "\nTask: Translate the following English sentence into **German**.\n"
+        f"Source sentence (EN): {source_sentence}"
+    )
+    return header + blocks + task
+
+def translate_with_gpt5(
+    sentences: List[str],
+    terms_for_rows: List[str],
+    examples_by_term: Dict[str, List[Dict[str, Any]]],
+    model: str = OPENAI_MODEL
+) -> List[str]:
+    client = openai_client()
+    outputs = []
+    for i, (sent, term) in enumerate(zip(sentences, terms_for_rows)):
+        examples = examples_by_term.get(term, [])
+        user_content = build_user_content(examples, sent)
+
+        if i == 0:  # transparency
+            print("----- Example messages sent to OpenAI -----")
+            print("[system] You are a precise legal/technical translator.")
+            print("[user]")
+            print(user_content)
+            print("--------------------------------------------------------")
+
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a precise legal/technical translator."},
+                    {"role": "user", "content": user_content},
+                ],
+                #temperature=0.2,
+            )
+            txt = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"[OpenAI] Error on sentence {i}: {e}")
+            txt = ""
+        outputs.append(txt)
+        #if SLEEP_BETWEEN_LLM_CALLS > 0:
+            #time.sleep(SLEEP_BETWEEN_LLM_CALLS)
+    return outputs
+
+translations = translate_with_gpt5(
+    sentences=source_sentences,
+    terms_for_rows=excel_terms,
+    examples_by_term=per_excel_examples,
+    model=OPENAI_MODEL
+)
+
+## ---------------------------
+# 6) Save to Excel with two sheets
+OUTPUT_XLSX = "translations_output.xlsx"
+
+trans_rows = []
+for i, (term, src, de_out) in enumerate(zip(excel_terms, source_sentences, translations)):
+    exs = per_excel_examples.get(term, [])
+    trans_rows.append({
+        "row": i,
+        "excel_term": term,
+        "source_sentence_en": src,
+        "translation_de": de_out,
+        "examples_used": len(exs)
+    })
+translations_df = pd.DataFrame(trans_rows)
+
+ex_rows = []
+for term in excel_terms:
+    for ex in per_excel_examples.get(term, []):
+        ex_rows.append({
+            "excel_term": term,
+            "kg_term": ex["kg_term"],
+            "cosine": ex["cosine"],
+            "jrc_index": ex["index"],
+            "jrc_en": ex["en"],
+            "jrc_de": ex["de"]
+        })
+examples_df = pd.DataFrame(ex_rows)
+
+with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+    translations_df.to_excel(writer, index=False, sheet_name="translations")
+    examples_df.to_excel(writer, index=False, sheet_name="examples")
+
+print(f"\n💾 Saved Excel workbook to: {OUTPUT_XLSX}")

@@ -1,0 +1,384 @@
+import os
+import re
+import time
+from typing import Dict, List, Tuple
+import pandas as pd
+import requests
+
+# =============================== KEYS =========================================
+#
+OPENAI_API_KEY = "xxx" # Set API key
+COREON_API_KEY = "xxx" # Set API key
+
+# ========================== FILE CONFIGURATION ==============================
+INPUT_XLSX  = "Dataset_English_German.xlsx"
+OUTPUT_XLSX = "Result_Translations_GPT5.xlsx"
+
+# 0-based indices
+TERMS_COL_IDX     = 0
+SENTENCES_COL_IDX = 2
+GOLD_DE_COL_IDX   = 4
+
+# Limit processing to the first N rows
+#N_SENTENCES = 100
+
+# Languages to fetch from Coreon
+TARGET_LANGS_FROM_KG = ["fr", "it", "es"]
+
+# Coreon KG
+COREON_BASE_URL = "https://r04-09.coreon.com/api/v1"
+
+# ============================== SETUP FOR GPT-5 ===============================
+from openai import OpenAI
+OPENAI_MODEL = "gpt-5-mini"
+
+# Rate limits
+SLEEP_BETWEEN_KG_CALLS  = 0.2
+SLEEP_BETWEEN_LLM_CALLS = 0.0
+
+# Limit how many rows to process
+#MAX_ROWS = 100
+
+# ================================ HELPERS ====================================
+
+def load_excel_safely(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        try:
+            from google.colab import files
+            print(f"'{path}' not found. Please upload it when prompted…")
+            uploaded = files.upload()
+            if path not in uploaded:
+                raise FileNotFoundError(f"Uploaded files do not include '{path}'.")
+        except Exception:
+            raise FileNotFoundError(
+                f"Could not find '{path}'. Place it next to this script "
+                "or upload it if using Colab."
+            )
+    return pd.read_excel(path)
+
+def safe_get_col(df: pd.DataFrame, idx: int, default=None):
+    try:
+        return df.iloc[:, idx]
+    except Exception:
+        return default
+
+def clean_list_str(xs: List[str]) -> List[str]:
+    return [str(x).strip() for x in xs if isinstance(x, str) and str(x).strip()]
+
+# ----------------------------- SETUP COREON KG --------------------------------------
+
+def coreon_headers() -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "X-Core-ApiKey": COREON_API_KEY
+    }
+
+def search_concept_in_coreon(query: str) -> List[dict]:
+    """Return hits list"""
+    url = f"{COREON_BASE_URL}/concepts/search"
+    payload = {
+        "search": {
+            "query": query,
+            "source_language": "en",
+            "select": {
+                "admin": False,
+                "history": False,
+                "languages": ["fr", "it", "es"],
+                "concept_properties": False,
+                "term_properties": ["Term Type"],
+                "relations": True
+            }
+        }
+    }
+    try:
+        r = requests.post(url, headers=coreon_headers(), json=payload, timeout=30)
+        if r.status_code == 200:
+            return r.json().get("hits", []) or []
+        else:
+            print(f"[Coreon] Non-200 status {r.status_code} for query '{query}'")
+            return []
+    except requests.exceptions.RequestException as e:
+        print(f"[Coreon] Request error for '{query}': {e}")
+        return []
+
+def extract_first_terms_from_first_hit(hits: List[dict]) -> Dict[str, List[str]]:
+    """
+    Use ONLY the first hit, and keep ONLY the first term per language.
+    """
+    result: Dict[str, List[str]] = {}
+    if not hits:
+        return result
+    first_hit = hits[0]
+    result_obj = first_hit.get("result", {}) or {}
+    seen_langs = set()
+
+    for term in result_obj.get("terms", []) or []:
+        lang = term.get("lang")
+        value = (term.get("value") or "").strip()
+        if not lang or not value:
+            continue
+        if lang not in seen_langs:
+            result[lang] = [value]
+            seen_langs.add(lang)
+        if seen_langs.issuperset(set(["en"] + TARGET_LANGS_FROM_KG)):
+            break
+    return result
+
+def fetch_term_glossary(term: str) -> Dict[str, List[str]]:
+    """
+    For one English term, fetch variants across languages.
+    """
+    hits = search_concept_in_coreon(term)
+    time.sleep(SLEEP_BETWEEN_KG_CALLS)
+
+    translations = extract_first_terms_from_first_hit(hits)
+    if "en" not in translations:
+        translations["en"] = [term]
+
+    pruned = {"en": translations.get("en", [])}
+    for lang in TARGET_LANGS_FROM_KG:
+        if lang in translations and translations[lang]:
+            pruned[lang] = translations[lang][:1]
+    return pruned
+
+# -------------------------- CONSTRUCT PROMPT -------------------------------
+
+SRC_LANG_NAME = "English"
+TGT_LANG_NAME = "German"
+
+def build_glossary_block(glossary: Dict[str, List[str]]) -> str:
+    chain_order = ["en", "fr", "it", "es"]
+    pieces = []
+    for lang in chain_order:
+        vals = glossary.get(lang, [])
+        if vals:
+            pieces.append(vals[0].strip())
+    if not pieces and glossary.get("en"):
+        pieces = [glossary["en"][0].strip()]
+    return " ".join(["means".join([pieces[0]] + pieces[1:])]) if pieces else ""
+
+
+def build_user_content(glossary_blocks: List[str], sentence: str) -> str:
+
+    dict_info = ""
+    chains = [b for b in glossary_blocks if b]
+    if chains:
+        dict_info = "TERMS (means-chains):\n" + "\n".join(chains) + "\n\n"
+
+    return (
+        f"Translate the following text from {SRC_LANG_NAME} into {TGT_LANG_NAME}. Use the French, Spanish and Italian words from the means-chain to create the translation and explain how you use the words."
+        f"{dict_info}"
+        f"TEXT:\n{sentence}"
+    )
+
+
+# ------------------------------ MAKE OpenAI CALLS ----------------------------------
+
+def openai_client() -> OpenAI:
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+def translate_with_gpt5(
+    sentences: List[str],
+    per_sentence_glossaries: List[List[Dict[str, List[str]]]]
+) -> List[str]:
+    client = openai_client()
+    outputs = []
+    for i, (sent, glosses) in enumerate(zip(sentences, per_sentence_glossaries)):
+        glossary_blocks = [build_glossary_block(g) for g in glosses]
+        user_content = build_user_content(glossary_blocks, sent)
+
+        if i == 0:
+            print("----- Example messages sent to OpenAI (first item) -----")
+            print("[system]")
+            print("[user]")
+            print(user_content)
+            print("--------------------------------------------------------")
+
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a precise legal/technical translator."},
+                    {"role": "user", "content": user_content},
+                ],
+                #temperature=0.2,
+                #max_tokens=400,
+            )
+            txt = (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            print(f"[OpenAI] Error on sentence {i}: {e}")
+            txt = ""
+        outputs.append(txt)
+        if SLEEP_BETWEEN_LLM_CALLS > 0:
+            time.sleep(SLEEP_BETWEEN_LLM_CALLS)
+    return outputs
+
+# ------------------------- COMBINE SENTENCES AND TERMS -------------------------------
+
+def build_term_cache(terms: List[str]) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Fetch Coreon data for each unique term.
+    """
+    cache: Dict[str, Dict[str, List[str]]] = {}
+    unique_terms = []
+    seen = set()
+    for t in terms:
+        if not isinstance(t, str):
+            continue
+        tt = t.strip()
+        if not tt:
+            continue
+        key = tt.lower()
+        if key not in seen:
+            seen.add(key)
+            unique_terms.append(tt)
+
+    print(f"Fetching glossaries for {len(unique_terms)} unique term(s)…")
+    for idx, term in enumerate(unique_terms, 1):
+        cache[term.lower()] = fetch_term_glossary(term)
+        if idx % 10 == 0:
+            print(f"  …{idx} terms done")
+    return cache
+
+def terms_in_sentence(sentence: str, term_cache: Dict[str, Dict[str, List[str]]]) -> List[str]:
+    """
+    Simple, case-insensitive matching.
+    """
+    if not isinstance(sentence, str):
+        return []
+    sent_lower = sentence.lower()
+    hits = []
+    for term_lower in term_cache.keys():
+        if " " in term_lower:
+            if term_lower in sent_lower:
+                hits.append(term_lower)
+        else:
+            if re.search(rf"\b{re.escape(term_lower)}\b", sent_lower):
+                hits.append(term_lower)
+    return hits
+
+def assemble_glossaries_for_sentences(
+    sentences: List[str],
+    term_cache: Dict[str, Dict[str, List[str]]]
+) -> Tuple[List[List[Dict[str, List[str]]]], List[List[str]]]:
+    """
+    For each sentence, find matched terms, then collect their glossaries.
+    """
+    per_sentence_glossaries: List[List[Dict[str, List[str]]]] = []
+    per_sentence_terms_used: List[List[str]] = []
+    for s in sentences:
+        matched_terms = terms_in_sentence(s, term_cache)
+        glosses = [term_cache[t] for t in matched_terms]
+        per_sentence_glossaries.append(glosses)
+        per_sentence_terms_used.append(matched_terms)
+    return per_sentence_glossaries, per_sentence_terms_used
+
+# =============================== PREFLIGHT CHECK ====================================
+
+def run_preflight_checks(df: pd.DataFrame, source_terms: List[str], source_sentences: List[str]) -> None:
+    """
+    Validate everything before writing any files.
+    """
+    # 1) Column sanity
+    n_cols = df.shape[1]
+    needed = [TERMS_COL_IDX, SENTENCES_COL_IDX, GOLD_DE_COL_IDX]
+    if any(idx >= n_cols for idx in needed):
+        raise RuntimeError(
+            f"Excel seems to have only {n_cols} columns; configured indices are {needed}."
+        )
+
+    # 2) Coreon test
+    test_term = next((t for t in source_terms if t), None)
+    if test_term:
+        gloss = fetch_term_glossary(test_term)
+        print(f"[Preflight] Coreon sample for '{test_term}' (first hit, one term/lang):")
+        print(gloss)
+        if not any(gloss.get(lang) for lang in ["fr", "it", "es"]):
+            print("[Preflight] Warning: Coreon returned no non-EN variants for the sample term.")
+    else:
+        print("[Preflight] No terms available to test Coreon. Skipping Coreon check.")
+
+    # 3) OpenAI test
+    test_sentence = next((s for s in source_sentences if s.strip()), None)
+    if test_sentence:
+        try:
+            client = openai_client()
+            test_user_content = (
+                f"Translate from {SRC_LANG_NAME} to {TGT_LANG_NAME}. "
+                "Provide only the translation, no explanations.\n\n"
+                f"TEXT:\n{test_sentence}"
+            )
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a precise translator."},
+                    {"role": "user", "content": test_user_content},
+                ],
+                #temperature=0.2,
+                #max_completion_tokens=60,
+            )
+            test_out = (resp.choices[0].message.content or "").strip()
+            print(f"[Preflight] OpenAI sample translation:\n{test_out}")
+            if not test_out:
+                raise RuntimeError("OpenAI test produced an empty translation.")
+        except Exception as e:
+            raise RuntimeError(f"OpenAI API test failed: {e}")
+    else:
+        print("[Preflight] No sentences available to test OpenAI. Skipping OpenAI check.")
+
+# ================================= MAIN =======================================
+
+def main():
+    # 0) Key sanity
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Please set OPENAI_API_KEY at the top of this file.")
+    if not COREON_API_KEY:
+        raise RuntimeError("Please set COREON_API_KEY at the top of this file.")
+
+    # 1) Load Excel
+    df = load_excel_safely(INPUT_XLSX)
+
+    # Keep only the first N rows
+    #df_sub = df.iloc[:N_SENTENCES].copy()
+
+    # Pull the three columns
+    terms_series     = safe_get_col(df_sub, TERMS_COL_IDX, pd.Series(dtype=object))
+    sentences_series = safe_get_col(df_sub, SENTENCES_COL_IDX, pd.Series(dtype=object))
+    gold_series      = safe_get_col(df_sub, GOLD_DE_COL_IDX, pd.Series(dtype=object))
+
+    # Convert to lists
+    source_terms     = clean_list_str(terms_series.fillna("").astype(str).tolist()) if terms_series is not None else []
+    source_sentences = sentences_series.fillna("").astype(str).tolist() if sentences_series is not None else []
+    gold_de          = gold_series.fillna("").astype(str).tolist() if gold_series is not None else []
+
+    print(f"Loaded {len(source_terms)} terms, {len(source_sentences)} sentences (first {N_SENTENCES} rows).")
+
+    # 2) Make preflight checks
+    run_preflight_checks(df_sub, source_terms, source_sentences)
+
+    # 3) Build Coreon term cache
+    term_cache = build_term_cache(source_terms)
+
+    # 4) Attach relevant glossaries per sentence
+    per_sentence_glossaries, _ = assemble_glossaries_for_sentences(
+        source_sentences, term_cache
+    )
+
+    # 5) Translate with GPT-5
+    model_translations = translate_with_gpt5(source_sentences, per_sentence_glossaries)
+
+    # 6) Prepare output
+    if len(gold_de) < len(source_sentences):
+        gold_de = gold_de + [""] * (len(source_sentences) - len(gold_de))
+
+    out = pd.DataFrame({
+        "sentence_ro": source_sentences,
+        "gold_de": gold_de[:len(source_sentences)],
+        "model_de": model_translations
+    })
+
+    out.to_excel(OUTPUT_XLSX, index=False)
+    print(f"✅ Done. Wrote: {OUTPUT_XLSX}")
+
+if __name__ == "__main__":
+    main()
